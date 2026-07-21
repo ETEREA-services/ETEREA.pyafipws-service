@@ -2,6 +2,55 @@
 
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 
+## [2.6.0] - 2026-07-08
+
+### Nuevas características
+- **Verificación de Certificados AFIP**: Se agregó un nuevo endpoint `GET /api/afipws/certificado/verificar` que permite:
+  - Validación local del certificado X.509 (fechas de validez, extracción de CUIT, emisor y sujeto).
+  - Verificación online de autenticación WSAA contra AFIP (production/homologación).
+  - Integración con OpenTelemetry para trazabilidad completa.
+- **Endpoint de Verificación de Certificados**: Nuevo recurso REST (`CertificadoVerificarResource`) con modelo de respuesta `CertCheckResponse` documentado en Swagger.
+
+### Cambios técnicos
+- Actualizado `app/routes.py` con nuevo endpoint y modelo Swagger.
+- Añadidas importaciones de `cryptography.x509`, `pyafipws.wsaa.WSAA` y constantes `URL_WSAA_HOMO`/`URL_WSAA_PROD`.
+- Actualizada versión de la API en `app/service.py` a 2.6.0.
+- Actualizada versión del recurso OpenTelemetry en `app/otel_setup.py`.
+
+## [2.5.0] - 2026-07-08
+
+### Nuevas características
+- **Importe Exento**: Se agregó soporte para el campo `exento` (importe exento) en la facturación electrónica, mapeándolo al campo `imp_op_ex` del comprobante AFIP.
+
+### Mejoras
+- **Documentación Swagger**: Se añadió el campo `exento` al modelo de datos de facturación con descripción y ejemplo.
+- **Documentación API**: Se actualizó la documentación del README para incluir el nuevo campo `exento`.
+
+### Cambios técnicos
+- Actualizado `app/factura_electronica.py` para incluir `imp_op_ex` en la creación del comprobante.
+- Actualizado `app/routes.py` para exponer el campo `exento` en el modelo Swagger.
+- Actualizada versión de la API en `app/service.py` a 2.5.0.
+
+## [2.4.0] - 2026-01-01
+
+### Nuevas características
+- **Facturación de Exportación**: Se agregó soporte completo para emisión de comprobantes electrónicos de exportación (WSFEXv1) incluyendo:
+  - Nuevo endpoint `POST /api/afipws/facturador_exportacion`
+  - Integración con servicio AFIP WSFEXv1 para comprobantes de exportación
+  - Soporte para facturas de exportación E con múltiples monedas
+  - Validación completa de datos de exportación según normativa AFIP
+  - Manejo de incoterms, permisos de embarque y datos de importadores
+
+### Mejoras
+- **Documentación Swagger**: Se añadieron modelos completos de datos para facturación de exportación con validación automática
+- **Ejemplos de Uso**: Se incluyeron ejemplos detallados de facturación de exportación en la documentación
+- **Logging Mejorado**: Agregado logging específico para operaciones de exportación con trazabilidad completa
+
+### Cambios técnicos
+- Nuevo archivo `app/factura_exportacion.py` con lógica completa de facturación de exportación
+- Actualizado `app/routes.py` para incluir el nuevo endpoint y modelos Swagger
+- Actualizada documentación del README con ejemplos de facturación de exportación
+
 ## [2.3.0] - 2025-07-09
 
 ### Nuevas características
