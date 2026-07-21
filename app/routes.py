@@ -2,9 +2,14 @@ import json
 from flask import request
 from flask_restx import Namespace, Resource, fields
 from app.logger_setup import logger
-from app.factura_electronica import facturar, consultar_comprobante
+from app.factura_electronica import facturar, consultar_comprobante, URL_WSAA_HOMO, URL_WSAA_PROD
+from app.factura_exportacion import facturar_exportacion
 from app.otel_setup import get_tracer
 from typing import Dict
+from cryptography import x509
+from datetime import datetime, timezone
+from pyafipws.wsaa import WSAA
+
 
 # Crear namespace para Flask-RESTX
 afipws_ns = Namespace('afipws', description='Operaciones de facturación AFIP')
@@ -21,6 +26,7 @@ factura_model = afipws_ns.model('Factura', {
     'total': fields.Float(required=True, description='Importe total', example=1210.0),
     'id_condicion_iva': fields.Integer(required=True, description='ID de condición IVA del receptor', example=1),
     'neto': fields.Float(description='Importe neto gravado', example=1000.0),
+    'exento': fields.Float(description='Importe exento', example=0.0),
     'iva': fields.Float(description='Importe IVA 21%', example=210.0),
     'neto105': fields.Float(description='Importe neto gravado 10.5%', example=0.0),
     'iva105': fields.Float(description='Importe IVA 10.5%', example=0.0),
@@ -28,6 +34,40 @@ factura_model = afipws_ns.model('Factura', {
     'asociado_punto_venta': fields.Integer(description='Punto de venta del comprobante asociado'),
     'asociado_numero_comprobante': fields.Integer(description='Número de comprobante asociado'),
     'asociado_fecha_comprobante': fields.String(description='Fecha del comprobante asociado')
+})
+
+item_exportacion_model = afipws_ns.model('ItemExportacion', {
+    'pro_codigo': fields.String(required=True, description='Código del producto'),
+    'pro_ds': fields.String(required=True, description='Descripción del producto'),
+    'pro_qty': fields.Float(required=True, description='Cantidad'),
+    'pro_umed': fields.Integer(required=True, description='Unidad de medida AFIP'),
+    'pro_precio_uni': fields.Float(required=True, description='Precio unitario'),
+    'pro_total_item': fields.Float(required=True, description='Total del item'),
+    'pro_bonificacion': fields.Float(description='Bonificación')
+})
+
+factura_exportacion_model = afipws_ns.model('FacturaExportacion', {
+    'tipo_afip': fields.Integer(required=True, description='Tipo de comprobante AFIP (e.g. 19)', example=19),
+    'punto_venta': fields.Integer(required=True, description='Punto de venta', example=1),
+    'cliente': fields.String(required=True, description='Nombre del cliente importador'),
+    'pais_dst_cmp': fields.Integer(required=True, description='Código de país de destino (AFIP)', example=200),
+    'total': fields.Float(required=True, description='Importe total', example=1000.0),
+    'moneda_id': fields.String(required=True, description='Código de moneda (e.g. DOL)', example='DOL'),
+    'moneda_ctz': fields.Float(required=True, description='Cotización de la moneda', example=1000.0),
+    'items': fields.List(fields.Nested(item_exportacion_model), required=True, description='Items de la factura'),
+    'cuit_pais_cliente': fields.Integer(description='CUIT/TaxID del cliente en su país', default=0),
+    'domicilio_cliente': fields.String(description='Domicilio del cliente'),
+    'id_impositivo': fields.String(description='ID Impositivo del cliente'),
+    'incoterms': fields.String(description='Código Incoterms (e.g. FOB)'),
+    'incoterms_ds': fields.String(description='Descripción Incoterms'),
+    'obs_comerciales': fields.String(description='Observaciones comerciales'),
+    'obs_generales': fields.String(description='Observaciones generales'),
+    'forma_pago': fields.String(description='Forma de pago'),
+    'permiso_existente': fields.String(description='Permiso de embarque existente (S/N)', default='N'),
+    'tipo_expo': fields.Integer(description='Tipo de exportación (1=Bienes, 2=Servicios)', default=1),
+    'idioma_cbte': fields.Integer(description='Idioma (1=Español)', default=1),
+    'numero_comprobante': fields.Integer(description='Número de comprobante (opcional, si no se envía se calcula el siguiente)'),
+    'fecha_comprobante': fields.String(description='Fecha del comprobante YYYYMMDD (opcional, default hoy)')
 })
 
 response_model = afipws_ns.model('Response', {
@@ -57,6 +97,20 @@ factura_response_model = afipws_ns.model('FacturaResponse', {
     'asociado_numero_comprobante': fields.Integer(description='Número de comprobante asociado'),
     'asociado_fecha_comprobante': fields.String(description='Fecha del comprobante asociado'),
     'id_condicion_iva': fields.Integer(description='ID de condición IVA del receptor')
+})
+
+factura_exportacion_response_model = afipws_ns.model('FacturaExportacionResponse', {
+    'resultado': fields.String(description='Resultado de la autorización'),
+    'cae': fields.String(description='Número de CAE'),
+    'vencimiento_cae': fields.String(description='Fecha de vencimiento del CAE'),
+    'numero_comprobante': fields.Integer(description='Número de comprobante'),
+    'fecha_comprobante': fields.String(description='Fecha del comprobante'),
+    'tipo_afip': fields.Integer(description='Tipo de comprobante AFIP'),
+    'punto_venta': fields.Integer(description='Punto de venta'),
+    'cliente': fields.String(description='Cliente'),
+    'total': fields.Float(description='Total'),
+    'moneda_id': fields.String(description='Moneda'),
+    'moneda_ctz': fields.Float(description='Cotización')
 })
 
 test_response_model = afipws_ns.model('TestResponse', {
@@ -90,6 +144,157 @@ class TestResource(Resource):
         else:
             logger.info("test")
             return {"test": "ok"}
+
+
+cert_check_response_model = afipws_ns.model('CertCheckResponse', {
+    'valido': fields.Boolean(description='Indica si el certificado es válido actualmente (localmente)'),
+    'cuit': fields.String(description='CUIT extraído del certificado'),
+    'not_before': fields.String(description='Fecha de inicio de validez'),
+    'not_after': fields.String(description='Fecha de vencimiento'),
+    'dias_restantes': fields.Integer(description='Días restantes hasta la expiración'),
+    'emisor': fields.String(description='Emisor del certificado (CA)'),
+    'sujeto': fields.String(description='Sujeto del certificado'),
+    'autenticacion_afip_ok': fields.Boolean(description='Indica si la autenticación WSAA con AFIP fue exitosa (verificación online)'),
+    'error_afip': fields.String(description='Mensaje de error si la autenticación con AFIP falló')
+})
+
+
+@afipws_ns.route('/certificado/verificar')
+class CertificadoVerificarResource(Resource):
+    @afipws_ns.doc('verificar_certificado')
+    @afipws_ns.marshal_with(cert_check_response_model)
+    def get(self):
+        """Verifica la validez local y la autenticación ante AFIP del certificado configurado."""
+        tracer = get_tracer()
+        
+        def _verificar():
+            cert_path = _afip_config.get('cert_path')
+            privatekey_path = _afip_config.get('privatekey_path')
+            production = _afip_config.get('production', False)
+            
+            # 1. Validación Local del Certificado
+            try:
+                with open(cert_path, "rb") as f:
+                    cert_data = f.read()
+                
+                cert = x509.load_pem_x509_certificate(cert_data)
+                
+                # Obtener fechas de validez (soportando versiones de cryptography con _utc)
+                not_before = getattr(cert, 'not_valid_before_utc', cert.not_valid_before)
+                not_after = getattr(cert, 'not_valid_after_utc', cert.not_valid_after)
+                
+                # Asegurar timezone-aware para la comparación si corresponde
+                now = datetime.now(timezone.utc) if not_before.tzinfo else datetime.now()
+                
+                valido_local = not_before <= now <= not_after
+                dias_restantes = (not_after - now).days
+                
+                # Extraer CUIT y detalles
+                sujeto_str = cert.subject.rfc4514_string()
+                emisor_str = cert.issuer.rfc4514_string()
+                
+                # Intentar extraer el CUIT de los atributos del Subject
+                cuit_extraido = "No encontrado"
+                for attribute in cert.subject:
+                    oid_str = attribute.oid.dotted_string
+                    # OID 2.5.4.5 es serialNumber (donde AFIP suele guardar el CUIT como CUIT 20XXXXXXXX9)
+                    if oid_str == "2.5.4.5":
+                        cuit_extraido = attribute.value
+                        break
+                    # OID 2.5.4.3 es commonName
+                    elif oid_str == "2.5.4.3" and "CUIT" in attribute.value:
+                        cuit_extraido = attribute.value
+                        break
+                        
+            except Exception as e:
+                logger.error(f"Error al analizar el certificado localmente: {e}")
+                afipws_ns.abort(500, f"Error al leer/analizar el archivo de certificado: {str(e)}")
+
+            # 2. Validación Online (Autenticación WSAA ante AFIP)
+            autenticacion_afip_ok = False
+            error_afip = None
+            
+            try:
+                URL_WSAA = URL_WSAA_PROD if production else URL_WSAA_HOMO
+                wsaa = WSAA()
+                # Intenta obtener un Ticket de Acceso (TA) para el servicio 'wsfe'
+                ta = wsaa.Autenticar(
+                    "wsfe", cert_path, privatekey_path, wsdl=URL_WSAA, cache="", debug=False
+                )
+                if ta:
+                    autenticacion_afip_ok = True
+            except Exception as auth_error:
+                logger.warning(f"Fallo en la autenticación online con AFIP: {auth_error}")
+                error_afip = str(auth_error)
+
+            return {
+                'valido': valido_local,
+                'cuit': cuit_extraido,
+                'not_before': not_before.isoformat(),
+                'not_after': not_after.isoformat(),
+                'dias_restantes': dias_restantes,
+                'emisor': emisor_str,
+                'sujeto': sujeto_str,
+                'autenticacion_afip_ok': autenticacion_afip_ok,
+                'error_afip': error_afip
+            }
+
+        if tracer:
+            with tracer.start_as_current_span("verificar_certificado_endpoint") as span:
+                span.set_attribute("endpoint", "/certificado/verificar")
+                span.set_attribute("method", "GET")
+                res = _verificar()
+                span.set_attribute("cert.valido_local", res['valido'])
+                span.set_attribute("cert.autenticacion_afip_ok", res['autenticacion_afip_ok'])
+                return res
+        else:
+            return _verificar()
+
+
+@afipws_ns.route('/facturador_exportacion')
+class FacturadorExportacionResource(Resource):
+    @afipws_ns.doc('facturar_exportacion')
+    @afipws_ns.expect(factura_exportacion_model)
+    @afipws_ns.marshal_with(factura_exportacion_response_model)
+    def post(self):
+        """Endpoint para procesar facturas de exportación AFIP (WSFEXv1)."""
+        tracer = get_tracer()
+        if tracer:
+            with tracer.start_as_current_span("facturar_exportacion_endpoint") as span:
+                span.set_attribute("endpoint", "/facturador_exportacion")
+                span.set_attribute("method", "POST")
+                try:
+                    json_data = request.get_json()
+                    if json_data is None:
+                        span.set_attribute("error", "No se proporcionó un JSON válido")
+                        afipws_ns.abort(400, "No se proporcionó un JSON válido")
+
+                    logger.info("facturando exportacion ...")
+                    production = _afip_config.get('production', False)
+                    
+                    with tracer.start_as_current_span("facturar_exportacion_afip") as factura_span:
+                        factura_span.set_attribute("afip.production", production)
+                        result = facturar_exportacion(json_data, production=production)
+                    
+                    return result
+                except Exception as e:
+                    span.set_attribute("error", str(e))
+                    logger.error(f'Error al facturar exportacion: {str(e)}')
+                    return {"success": False, "error": str(e)}, 500
+        else:
+            try:
+                json_data = request.get_json()
+                if json_data is None:
+                    afipws_ns.abort(400, "No se proporcionó un JSON válido")
+                
+                logger.info("facturando exportacion ...")
+                production = _afip_config.get('production', False)
+                result = facturar_exportacion(json_data, production=production)
+                return result
+            except Exception as e:
+                logger.error(f'Error al facturar exportacion: {str(e)}')
+                return {"success": False, "error": str(e)}, 500
+
 
 
 @afipws_ns.route('/consulta_comprobante')
